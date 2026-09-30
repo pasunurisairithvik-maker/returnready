@@ -57,6 +57,55 @@ class AppTests(TestCase):
     def test_csv_injection(self):
         self.p.title='=HYPERLINK("bad")';self.p.save();self.assertIn(b"'=HYPERLINK",self.client.get('/export/').content)
         self.assertEqual(csv_safe(' +123'),"' +123")
+    def test_zero_amount_export_preserved(self):
+        import csv
+        self.p.amount=0;self.p.save()
+        rows=list(csv.reader(io.StringIO(self.client.get('/export/').content.decode())))
+        self.assertEqual(rows[1][2],'0.00');self.assertEqual(rows[1][-1],'False')
+    def test_image_pixel_limit(self):
+        import warnings
+        out=io.BytesIO();Image.new('RGB',(4000,4000),'blue').save(out,'PNG')
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore',Image.DecompressionBombWarning)
+            form=PurchaseForm(self.data(),{'receipt_file':SimpleUploadedFile('large.png',out.getvalue(),'image/png')})
+            self.assertFalse(form.is_valid())
+    def test_multiple_files_rejected(self):
+        data=self.data();data['receipt_file']=[SimpleUploadedFile('a.pdf',b'%PDF-1.4\n%%EOF'),SimpleUploadedFile('b.pdf',b'%PDF-1.4\n%%EOF')]
+        self.assertEqual(self.client.post('/purchases/new/',data).status_code,400)
+        self.assertFalse(Purchase.objects.filter(title='Mixer').exists())
+    def test_backup_complete_and_private(self):
+        import zipfile,json
+        other=Purchase.objects.create(owner=self.b,title='Other account secret',retailer='Elsewhere',amount=1,bought=timezone.localdate())
+        Receipt.objects.create(purchase=other,data=b'private-other-file',name='receipt.pdf',content_type='application/pdf')
+        self.p.deleted_at=timezone.now();self.p.save()
+        r=self.client.get('/backup/');self.assertEqual(r.status_code,200)
+        with zipfile.ZipFile(io.BytesIO(r.content)) as archive:
+            manifest=json.loads(archive.read('purchases.json'))
+            self.assertEqual(len(manifest['purchases']),1);self.assertTrue(manifest['purchases'][0]['trashed'])
+            self.assertEqual(archive.read(f'receipts/{self.p.pk}/receipt.pdf'),b'%PDF-1.4\n%%EOF')
+            self.assertNotIn(b'private-other-file',r.content);self.assertNotIn(b'Other account secret',r.content)
+        self.client.logout();self.assertEqual(self.client.get('/backup/').status_code,302)
+    def test_purge_requires_owner_trash_password_and_confirmation(self):
+        url=f'/purchases/{self.p.pk}/purge/'
+        self.assertEqual(self.client.post(url).status_code,404)
+        self.p.deleted_at=timezone.now();self.p.save()
+        self.assertEqual(self.client.get(url).status_code,405)
+        for data in [{'password':'wrong','confirmation':'DELETE'},{'password':'private-battery-shelf-482!','confirmation':'NO'}]:
+            self.client.post(url,data);self.assertTrue(Purchase.objects.filter(pk=self.p.pk).exists())
+        self.client.force_login(self.b);self.assertEqual(self.client.post(url).status_code,404)
+        self.client.force_login(self.a)
+        self.client.post(url,{'password':'private-battery-shelf-482!','confirmation':'DELETE'})
+        self.assertFalse(Purchase.objects.filter(pk=self.p.pk).exists());self.assertFalse(Receipt.objects.filter(purchase_id=self.p.pk).exists())
+    def test_purge_releases_purchase_capacity(self):
+        self.p.deleted_at=timezone.now();self.p.save()
+        with override_settings(MAX_PURCHASES=1):
+            self.client.post('/purchases/new/',self.data());self.assertFalse(Purchase.objects.filter(title='Mixer').exists())
+            self.client.post(f'/purchases/{self.p.pk}/purge/',{'password':'private-battery-shelf-482!','confirmation':'DELETE'})
+            self.assertEqual(self.client.post('/purchases/new/',self.data()).status_code,302)
+    def test_calendar_last_representable_date(self):
+        from datetime import date
+        self.p.return_by=date.max;self.p.save()
+        r=self.client.get('/calendar/');self.assertEqual(r.status_code,200);self.assertIn(b'DTSTART;VALUE=DATE:99991231',r.content)
     def test_calendar_dates_and_alarms(self):
         content=self.client.get('/calendar/').content.decode();self.assertIn('TRIGGER:-P1D',content);self.assertIn(f'DTSTART;VALUE=DATE:{self.p.return_by:%Y%m%d}',content)
         self.client.post(f'/purchases/{self.p.pk}/status/',{'status':'returned'});self.assertNotIn('Headphones',self.client.get('/calendar/').content.decode())

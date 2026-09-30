@@ -1,6 +1,6 @@
-import csv, hashlib, hmac, io, json, secrets, time
+import csv, hashlib, hmac, io, json, secrets, time, zipfile
 from collections import defaultdict
-from datetime import timedelta
+from datetime import date, timedelta
 from decimal import Decimal
 from django.conf import settings
 from django.contrib import messages
@@ -38,7 +38,7 @@ def sign_up(request):
                 # Lock a stable row to serialize the free-tier account quota.
                 lock,_=Throttle.objects.get_or_create(key='account-capacity',defaults={'bucket':int(time.time()//900)})
                 Throttle.objects.select_for_update().get(pk=lock.pk)
-                if User.objects.count()>=settings.MAX_USERS:form.add_error(None,'The free beta is currently full.')
+                if User.objects.count()>=settings.MAX_USERS:form.add_error(None,'The free plan is currently full.')
                 else:
                     user=form.save();code=secrets.token_urlsafe(32)
                     Profile.objects.create(user=user,recovery_hash=digest(code));login(request,user)
@@ -100,9 +100,9 @@ def edit_purchase(request,pk=None):
                 capacity,_=Throttle.objects.get_or_create(key='receipt-capacity',defaults={'bucket':int(time.time()//900)})
                 Throttle.objects.select_for_update().get(pk=capacity.pk)
                 file=form.cleaned_data.get('receipt_file')
-                if not pk and Purchase.objects.filter(owner=request.user).count()>=settings.MAX_PURCHASES:form.add_error(None,'Free beta limit: 100 purchases, including trash. Export records before removing them permanently.')
-                elif file and not Receipt.objects.filter(purchase=purchase).exists() and Receipt.objects.filter(purchase__owner=request.user).count()>=settings.MAX_RECEIPTS:form.add_error('receipt_file','Free beta limit: 10 receipts. You can replace an existing receipt.')
-                elif file and not Receipt.objects.filter(purchase=purchase).exists() and Receipt.objects.count()>=100:form.add_error('receipt_file','Receipt storage for the free beta is full. Purchase tracking is still available.')
+                if not pk and Purchase.objects.filter(owner=request.user).count()>=settings.MAX_PURCHASES:form.add_error(None,'Free plan limit: 100 purchases, including trash. Export records before removing them permanently.')
+                elif file and not Receipt.objects.filter(purchase=purchase).exists() and Receipt.objects.filter(purchase__owner=request.user).count()>=settings.MAX_RECEIPTS:form.add_error('receipt_file','Free plan limit: 10 receipts. You can replace an existing receipt.')
+                elif file and not Receipt.objects.filter(purchase=purchase).exists() and Receipt.objects.count()>=100:form.add_error('receipt_file','Receipt storage for the free plan is full. Purchase tracking is still available.')
                 else:
                     purchase=form.save()
                     if file:Receipt.objects.update_or_create(purchase=purchase,defaults=dict(zip(['data','name','content_type'],file)))
@@ -120,30 +120,66 @@ def receipt(request,pk):
 @login_required
 @require_POST
 def trash(request,pk):
-    item=get_object_or_404(owned(request),pk=pk);item.deleted_at=timezone.now();item.save(update_fields=['deleted_at'])
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=request.user.pk)
+        item=get_object_or_404(owned(request),pk=pk);item.deleted_at=timezone.now();item.save(update_fields=['deleted_at'])
     messages.success(request,'Moved to trash. You can restore it.');return redirect('dashboard')
 @login_required
 def trash_list(request):return render(request,'trash.html',{'items':Purchase.objects.filter(owner=request.user,deleted_at__isnull=False)})
 @login_required
 @require_POST
 def restore(request,pk):
-    item=get_object_or_404(Purchase,owner=request.user,pk=pk,deleted_at__isnull=False);item.deleted_at=None;item.save(update_fields=['deleted_at'])
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=request.user.pk)
+        item=get_object_or_404(Purchase,owner=request.user,pk=pk,deleted_at__isnull=False);item.deleted_at=None;item.save(update_fields=['deleted_at'])
     messages.success(request,'Purchase restored.');return redirect('detail',pk=pk)
 @login_required
 @require_POST
+def purge(request,pk):
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=request.user.pk)
+        item=get_object_or_404(Purchase.objects.select_for_update(),owner=request.user,pk=pk,deleted_at__isnull=False)
+        if limited('purge:'+str(request.user.pk),10):
+            messages.error(request,'Too many attempts. Try again in 15 minutes.')
+        elif request.POST.get('confirmation')=='DELETE' and request.user.check_password(request.POST.get('password','')):
+            item.delete()
+            messages.success(request,'Purchase and its receipt permanently deleted. Storage is available again.')
+        else:messages.error(request,'Enter your current password and DELETE to confirm permanent deletion.')
+    return redirect('trash_list')
+@login_required
+@require_POST
 def set_status(request,pk):
-    item=get_object_or_404(owned(request),pk=pk)
-    status=request.POST.get('status')
-    if status in dict(Purchase._meta.get_field('status').choices):item.status=status;item.save(update_fields=['status','updated'])
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=request.user.pk)
+        item=get_object_or_404(owned(request),pk=pk)
+        status=request.POST.get('status')
+        if status in dict(Purchase._meta.get_field('status').choices):item.status=status;item.save(update_fields=['status','updated'])
     return redirect('detail',pk=pk)
 def csv_safe(value):
-    value=str(value or '')
+    value='' if value is None else str(value)
     return "'"+value if value.lstrip().startswith(('=','+','-','@','\t','\r')) else value
 @login_required
 def export(request):
     response=HttpResponse(content_type='text/csv; charset=utf-8');response['Content-Disposition']='attachment; filename="returnready-purchases.csv"'
     writer=csv.writer(response);writer.writerow(['item','retailer','amount','currency','purchased','return_by','warranty_until','status','notes','trashed'])
     for p in Purchase.objects.filter(owner=request.user):writer.writerow([csv_safe(v) for v in [p.title,p.retailer,p.amount,p.currency,p.bought,p.return_by,p.warranty_until,p.status,p.notes,bool(p.deleted_at)]])
+    return response
+@login_required
+def backup(request):
+    # Bound output by the account's existing receipt quota; never include other users.
+    output=io.BytesIO()
+    with transaction.atomic():
+        User.objects.select_for_update().get(pk=request.user.pk)
+        purchases=list(Purchase.objects.filter(owner=request.user).order_by('created','pk'))
+        receipts=list(Receipt.objects.filter(purchase__owner=request.user))
+        manifest=[{'id':str(p.pk),'title':p.title,'retailer':p.retailer,'amount':str(p.amount),'currency':p.currency,'bought':str(p.bought),'return_by':str(p.return_by) if p.return_by else None,'warranty_until':str(p.warranty_until) if p.warranty_until else None,'status':p.status,'notes':p.notes,'trashed':bool(p.deleted_at)} for p in purchases]
+        with zipfile.ZipFile(output,'w',compression=zipfile.ZIP_STORED) as archive:
+            archive.writestr('purchases.csv',export(request).content)
+            archive.writestr('purchases.json',json.dumps({'format_version':1,'timezone':request.user.profile.timezone,'purchases':manifest},ensure_ascii=False,indent=2))
+            for receipt in receipts:archive.writestr('receipts/'+str(receipt.purchase_id)+'/'+receipt.name,bytes(receipt.data))
+            archive.writestr('README.txt','Private ReturnReady backup. Includes active and trashed purchases and receipt files. Keep this download securely. JSON identifiers match receipt folders. Automatic re-import is not supported. This archive contains no password or recovery code.\n')
+    response=HttpResponse(output.getvalue(),content_type='application/zip')
+    response['Content-Disposition']='attachment; filename="returnready-backup.zip"'
     return response
 def ics_escape(value):return str(value).replace('\\','\\\\').replace('\r','').replace('\n','\\n').replace(';','\\;').replace(',','\\,')
 def fold(line):
@@ -159,7 +195,7 @@ def calendar(request):
     for p in owned(request).exclude(status='returned'):
         for kind,label,day in [('return','Return deadline',p.return_by),('warranty','Warranty expiry',p.warranty_until)]:
             if not day or day<timezone.localdate():continue
-            lines+=['BEGIN:VEVENT',f'UID:{p.pk}-{kind}@returnready',f'DTSTAMP:{timezone.now():%Y%m%dT%H%M%SZ}',f'DTSTART;VALUE=DATE:{day:%Y%m%d}',f'DTEND;VALUE=DATE:{day+timedelta(days=1):%Y%m%d}',f'SUMMARY:{ics_escape(label+": "+p.title)}',f'DESCRIPTION:{ics_escape("Retailer: "+p.retailer+". Verify the applicable policy and local closing time.")}', 'BEGIN:VALARM','TRIGGER:-P1D','ACTION:DISPLAY',f'DESCRIPTION:{ics_escape(label+": "+p.title)}','END:VALARM','END:VEVENT']
+            lines+=['BEGIN:VEVENT',f'UID:{p.pk}-{kind}@returnready',f'DTSTAMP:{timezone.now():%Y%m%dT%H%M%SZ}',f'DTSTART;VALUE=DATE:{day:%Y%m%d}',*([f'DTEND;VALUE=DATE:{day+timedelta(days=1):%Y%m%d}'] if day<date.max else []),f'SUMMARY:{ics_escape(label+": "+p.title)}',f'DESCRIPTION:{ics_escape("Retailer: "+p.retailer+". Verify the applicable policy and local closing time.")}', 'BEGIN:VALARM','TRIGGER:-P1D','ACTION:DISPLAY',f'DESCRIPTION:{ics_escape(label+": "+p.title)}','END:VALARM','END:VEVENT']
     lines+=['END:VCALENDAR'];response=HttpResponse('\r\n'.join(fold(x) for x in lines)+'\r\n',content_type='text/calendar; charset=utf-8');response['Content-Disposition']='attachment; filename="returnready-deadlines.ics"';return response
 @login_required
 def account(request):

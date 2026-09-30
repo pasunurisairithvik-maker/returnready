@@ -33,10 +33,12 @@ class PurchaseForm(forms.ModelForm):
         try:
             Image.MAX_IMAGE_PIXELS=12_000_000
             with Image.open(BytesIO(raw)) as image:
-                if image.format not in ['JPEG','PNG']:raise ValueError()
+                if image.format not in ['JPEG','PNG'] or image.width*image.height>12_000_000:raise ValueError()
                 image.load();image.thumbnail((2400,2400));out=BytesIO()
                 image.convert('RGB').save(out,format='JPEG',quality=85)
-                return (out.getvalue(),'receipt.jpg','image/jpeg')
+                encoded=out.getvalue()
+                if len(encoded)>2*1024*1024:raise ValueError()
+                return (encoded,'receipt.jpg','image/jpeg')
         except (UnidentifiedImageError,ValueError,OSError,Image.DecompressionBombError,Image.DecompressionBombWarning):
             raise forms.ValidationError('Use a valid JPEG, PNG or PDF. Images are saved without metadata.')
 class RecoveryForm(forms.Form):
