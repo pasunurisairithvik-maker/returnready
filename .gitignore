@@ -5,3 +5,9 @@ __pycache__/
 .env
 staticfiles/
 test-results/
+
+backups/
+*.dump
+*.backup
+*.log
+sbom.json

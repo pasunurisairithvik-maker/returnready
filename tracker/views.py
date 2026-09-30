@@ -1,4 +1,4 @@
-import csv, hashlib, hmac, io, json, secrets, time, zipfile
+import csv, hashlib, hmac, io, json, secrets, time, zipfile, unicodedata, uuid
 from collections import defaultdict
 from datetime import date, timedelta
 from decimal import Decimal
@@ -15,6 +15,7 @@ from django.http import HttpResponse, JsonResponse
 from django.shortcuts import render, redirect, get_object_or_404
 from django.utils import timezone
 from django.views.decorators.http import require_POST
+from config.observability import audit
 from .models import Purchase,Receipt,Profile,Throttle
 from .forms import RegisterForm,PurchaseForm,RecoveryForm,SettingsForm
 User=get_user_model()
@@ -44,21 +45,22 @@ def sign_up(request):
                     Profile.objects.create(user=user,recovery_hash=digest(code));login(request,user)
                     return render(request,'recovery_code.html',{'code':code})
     return render(request,'form.html',{'form':form,'heading':'Your purchases. Your private space.','intro':'Create a username and a unique password. No email address required.','button':'Create account'})
+def canonical_username(value):return unicodedata.normalize('NFKC',value).strip().lower()
 def sign_in(request):
     data=request.POST.copy() if request.method=='POST' else None
-    if data is not None:data['username']=data.get('username','').lower()
+    if data is not None:data['username']=canonical_username(data.get('username',''))
     form=AuthenticationForm(request,data=data)
     if request.method=='POST':
-        if limited('login:'+data.get('username',''),10):form.add_error(None,'Too many attempts. Try again in 15 minutes.')
+        if limited('authentication-global',500) or limited('login:'+data.get('username',''),10):form.add_error(None,'Too many attempts. Try again in 15 minutes.')
         elif form.is_valid():login(request,form.get_user());return redirect('dashboard')
     return render(request,'form.html',{'form':form,'heading':'Welcome back.','intro':'Sign in to your private purchase vault.','button':'Sign in','recover':True})
 def recover(request):
     form=RecoveryForm(request.POST or None)
     if request.method=='POST':
-        if limited('recover:'+request.POST.get('username','').lower(),5):form.add_error(None,'Too many attempts. Try again in 15 minutes.')
+        if limited('authentication-global',500) or limited('recover:'+canonical_username(request.POST.get('username','')),5):form.add_error(None,'Too many attempts. Try again in 15 minutes.')
         elif form.is_valid():
             with transaction.atomic():
-                user=User.objects.filter(username=form.cleaned_data['username'].lower()).first()
+                user=User.objects.filter(username=canonical_username(form.cleaned_data['username'])).first()
                 profile=Profile.objects.select_for_update().filter(user=user).first() if user else None
                 if not profile or not secrets.compare_digest(profile.recovery_hash,digest(form.cleaned_data['recovery_code'])):form.add_error(None,'Username or recovery code is incorrect.')
                 else:
@@ -91,7 +93,7 @@ def dashboard(request):
 @login_required
 def edit_purchase(request,pk=None):
     purchase=get_object_or_404(owned(request),pk=pk) if pk else Purchase(owner=request.user,bought=timezone.localdate())
-    form=PurchaseForm(request.POST or None,request.FILES or None,instance=purchase)
+    form=PurchaseForm(request.POST or None,request.FILES or None,instance=purchase,initial={'submission_id':None if pk else uuid.uuid4()})
     if request.method=='POST':
         if getattr(request,'upload_rejected',False):form.add_error('receipt_file','Upload was rejected. Use a file smaller than 2 MB.')
         if form.is_valid():
@@ -100,11 +102,25 @@ def edit_purchase(request,pk=None):
                 capacity,_=Throttle.objects.get_or_create(key='receipt-capacity',defaults={'bucket':int(time.time()//900)})
                 Throttle.objects.select_for_update().get(pk=capacity.pk)
                 file=form.cleaned_data.get('receipt_file')
+                submission=form.cleaned_data.get('submission_id') if not pk else None
+                fingerprint_data={k:str(v) if v is not None else None for k,v in form.cleaned_data.items() if k not in ['receipt_file','submission_id']}
+                fingerprint_data['amount']=format(form.cleaned_data['amount'],'.2f')
+                fingerprint_data['receipt']=hashlib.sha256(file[0]).hexdigest() if file else None
+                fingerprint=hashlib.sha256(json.dumps(fingerprint_data,sort_keys=True).encode()).hexdigest()
+                prior=Purchase.objects.filter(owner=request.user,submission_id=submission).first() if submission else None
+                if prior:
+                    if prior.submission_hash==fingerprint:
+                        if prior.deleted_at:
+                            messages.info(request,'This submission was already saved and is now in trash.');return redirect('trash_list')
+                        return redirect('detail',pk=prior.pk)
+                    form.add_error(None,'This form was already submitted with different data. Open a new purchase form.');return render(request,'form.html',{'form':form,'heading':'Keep your next purchase organised.','button':'Save purchase','multipart':True})
                 if not pk and Purchase.objects.filter(owner=request.user).count()>=settings.MAX_PURCHASES:form.add_error(None,'Free plan limit: 100 purchases, including trash. Export records before removing them permanently.')
                 elif file and not Receipt.objects.filter(purchase=purchase).exists() and Receipt.objects.filter(purchase__owner=request.user).count()>=settings.MAX_RECEIPTS:form.add_error('receipt_file','Free plan limit: 10 receipts. You can replace an existing receipt.')
                 elif file and not Receipt.objects.filter(purchase=purchase).exists() and Receipt.objects.count()>=100:form.add_error('receipt_file','Receipt storage for the free plan is full. Purchase tracking is still available.')
                 else:
-                    purchase=form.save()
+                    purchase=form.save(commit=False)
+                    if submission:purchase.submission_id=submission;purchase.submission_hash=fingerprint
+                    purchase.save()
                     if file:Receipt.objects.update_or_create(purchase=purchase,defaults=dict(zip(['data','name','content_type'],file)))
                     messages.success(request,'Purchase saved.');return redirect('detail',pk=purchase.pk)
     return render(request,'form.html',{'form':form,'heading':'Edit purchase' if pk else 'Keep your next purchase organised.','intro':'Use the deadline printed on your receipt or retailer policy. We do not guess return rules.','button':'Save purchase','multipart':True})
@@ -142,7 +158,7 @@ def purge(request,pk):
         if limited('purge:'+str(request.user.pk),10):
             messages.error(request,'Too many attempts. Try again in 15 minutes.')
         elif request.POST.get('confirmation')=='DELETE' and request.user.check_password(request.POST.get('password','')):
-            item.delete()
+            item.delete();audit(request,'purchase_purged')
             messages.success(request,'Purchase and its receipt permanently deleted. Storage is available again.')
         else:messages.error(request,'Enter your current password and DELETE to confirm permanent deletion.')
     return redirect('trash_list')
@@ -178,6 +194,7 @@ def backup(request):
             archive.writestr('purchases.json',json.dumps({'format_version':1,'timezone':request.user.profile.timezone,'purchases':manifest},ensure_ascii=False,indent=2))
             for receipt in receipts:archive.writestr('receipts/'+str(receipt.purchase_id)+'/'+receipt.name,bytes(receipt.data))
             archive.writestr('README.txt','Private ReturnReady backup. Includes active and trashed purchases and receipt files. Keep this download securely. JSON identifiers match receipt folders. Automatic re-import is not supported. This archive contains no password or recovery code.\n')
+    audit(request,'backup_downloaded')
     response=HttpResponse(output.getvalue(),content_type='application/zip')
     response['Content-Disposition']='attachment; filename="returnready-backup.zip"'
     return response
@@ -205,13 +222,18 @@ def account(request):
 @login_required
 def change_password(request):
     form=PasswordChangeForm(request.user,request.POST or None)
-    if request.method=='POST' and form.is_valid():user=form.save();update_session_auth_hash(request,user);messages.success(request,'Password updated. Other sessions are invalidated.');return redirect('account')
+    if request.method=='POST':
+        if limited('sensitive:'+str(request.user.pk),10):form.add_error(None,'Too many attempts. Try again in 15 minutes.')
+        elif form.is_valid():
+            user=form.save();update_session_auth_hash(request,user);audit(request,'password_changed');messages.success(request,'Password updated. Other sessions are invalidated.');return redirect('account')
     return render(request,'form.html',{'form':form,'heading':'Change your password','button':'Update password'})
 @login_required
 @require_POST
 def delete_account(request):
+    if limited('sensitive:'+str(request.user.pk),10):
+        messages.error(request,'Too many attempts. Try again in 15 minutes.');return redirect('account')
     if request.POST.get('confirmation')=='DELETE' and request.user.check_password(request.POST.get('password','')):
-        user=request.user;logout(request);user.delete();messages.success(request,'Account and active purchase records deleted. Provider backups may retain older copies temporarily.');return redirect('home')
+        user=request.user;logout(request);user.delete();audit(request,'account_deleted');messages.success(request,'Account and active purchase records deleted. Provider backups may retain older copies temporarily.');return redirect('home')
     messages.error(request,'Enter your password and DELETE to confirm.');return redirect('account')
 def privacy(request):return render(request,'privacy.html')
 def health(request):
@@ -219,3 +241,5 @@ def health(request):
         with connection.cursor() as cursor:cursor.execute('SELECT 1 FROM tracker_purchase LIMIT 1')
         return JsonResponse({'status':'ok','service':'returnready'})
     except Exception:return JsonResponse({'status':'unavailable'},status=503)
+
+def live(request):return JsonResponse({'status':'ok','service':'returnready'})

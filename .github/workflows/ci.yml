@@ -1,16 +1,19 @@
-name: App checks
+name: Release checks
+permissions:
+  contents: read
 on:
   push:
   pull_request:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17
         env:
           POSTGRES_PASSWORD: test-only-password
-          POSTGRES_DB: returnready
+          POSTGRES_DB: returnready_ci
         ports: ['5432:5432']
         options: >-
           --health-cmd pg_isready --health-interval 10s --health-timeout 5s --health-retries 5
@@ -26,9 +29,45 @@ jobs:
       - run: python manage.py test
         env:
           DEBUG: '1'
-          DATABASE_URL: postgres://postgres:test-only-password@localhost:5432/returnready
+          DATABASE_URL: postgres://postgres:test-only-password@localhost:5432/returnready_ci?sslmode=disable
           LOCAL_POSTGRES: '1'
       - run: python manage.py check --deploy --fail-level WARNING
         env:
           SECRET_KEY: ci-only-secret-key-not-used-for-deployment-8f10f8bebd68
-          DATABASE_URL: postgres://postgres:test-only-password@localhost:5432/returnready
+          DATABASE_URL: postgres://postgres:test-only-password@localhost:5432/returnready_ci?sslmode=disable
+
+      - name: Audit application dependencies and generate SBOM
+        run: |
+          pip install pip-audit==2.10.1
+          pip-audit --strict -r requirements.txt -f cyclonedx-json -o sbom.json
+      - name: Install official PostgreSQL 18 client for restore drill
+        run: |
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl --fail --silent --show-error https://www.postgresql.org/media/keys/ACCC4CF8.asc -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
+          ubuntu_codename=$(. /etc/os-release && echo "$VERSION_CODENAME")
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${ubuntu_codename}-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y postgresql-client-18
+      - name: Restore synthetic PostgreSQL backup into an isolated empty database
+        run: python ops/restore_drill.py
+        env:
+          DEBUG: '1'
+          DATABASE_URL: postgres://postgres:test-only-password@localhost:5432/returnready_ci?sslmode=disable
+          LOCAL_POSTGRES: '1'
+          RESTORE_DRILL: '1'
+      - name: Build and smoke-test non-root container
+        run: |
+          docker build --tag returnready-ci .
+          docker run --detach --name returnready-ci --publish 127.0.0.1:18080:10000 --env DEBUG=1 returnready-ci
+          test "$(docker inspect --format '{{.Config.User}}' returnready-ci)" = '10001:10001'
+          for attempt in $(seq 1 30); do
+            if curl --fail --silent http://127.0.0.1:18080/healthz; then break; fi
+            sleep 1
+          done
+          curl --fail --silent http://127.0.0.1:18080/healthz
+          curl --fail --silent http://127.0.0.1:18080/livez
+          docker rm --force returnready-ci
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dependency-sbom
+          path: sbom.json

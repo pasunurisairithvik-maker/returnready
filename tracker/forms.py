@@ -8,6 +8,7 @@ from .models import Purchase
 class RegisterForm(UserCreationForm):
     def clean_username(self):return super().clean_username().lower()
 class PurchaseForm(forms.ModelForm):
+    submission_id=forms.UUIDField(required=False,widget=forms.HiddenInput)
     receipt_file=forms.FileField(required=False,label='Receipt (JPEG, PNG or PDF · maximum 2 MB)')
     class Meta:
         model=Purchase

@@ -1,4 +1,4 @@
-# ReturnReady 1.0
+# ReturnReady 1.1
 
 Live website: https://returnready-nuwz.onrender.com/
 
@@ -41,3 +41,7 @@ Check /healthz with up to 90 seconds for free-host cold starts. A single timeout
 Includes protected full ZIP backups, password-and-confirmation gated permanent deletion from trash, CSV zero/boolean preservation, explicit 12-megapixel and 2-MB image bounds, and a one-file multipart limit. Capacity remains bounded for the free plan. No schema changes are required for this release.
 
 Rollback: redeploy the preceding known good commit after checking database compatibility. A rollback does not restore records that a user explicitly deleted. Download a backup before deletion; automatic restore/import is outside the supported scope. Keep provider credentials and database exports private.
+
+## Deployment hardening
+
+See [hardening scope](docs/HARDENING.md), [operator runbook](docs/OPERATIONS.md) and [security boundary](SECURITY.md). CI now also audits dependencies, produces an SBOM, verifies a synthetic PostgreSQL restore and builds/smoke-tests a non-root container. The current hosting remains bounded and free; enterprise availability and certification are not claimed.

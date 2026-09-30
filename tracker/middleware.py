@@ -3,7 +3,11 @@ from django.utils import timezone
 class Headers:
     def __init__(self,get_response): self.get_response=get_response
     def __call__(self,request):
-        if int(request.META.get('CONTENT_LENGTH') or 0)>3*1024*1024:
+        from django.http import HttpResponse
+        try:length=int(request.META.get('CONTENT_LENGTH') or 0)
+        except (ValueError,TypeError):return HttpResponse('Invalid request size.',status=400)
+        if length<0:return HttpResponse('Invalid request size.',status=400)
+        if length>3*1024*1024:
             from django.http import HttpResponse
             return HttpResponse('Upload too large. Use a receipt of 2 MB or smaller.',status=413)
         response=self.get_response(request)
