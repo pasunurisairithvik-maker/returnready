@@ -76,7 +76,7 @@ def sign_out(request):logout(request);return redirect('home')
 def owned(request):return Purchase.objects.filter(owner=request.user,deleted_at__isnull=True)
 @login_required
 def dashboard(request):
-    today=timezone.localdate();all_items=owned(request).select_related('receipt')
+    today=timezone.localdate();all_items=owned(request).select_related('receipt').defer('receipt__data')
     near=all_items.exclude(status='returned').filter(return_by__range=(today,today+timedelta(days=7))).order_by('return_by')
     warranties=all_items.exclude(status='returned').filter(warranty_until__gte=today).count()
     totals=defaultdict(Decimal)
@@ -109,7 +109,7 @@ def edit_purchase(request,pk=None):
                     messages.success(request,'Purchase saved.');return redirect('detail',pk=purchase.pk)
     return render(request,'form.html',{'form':form,'heading':'Edit purchase' if pk else 'Keep your next purchase organised.','intro':'Use the deadline printed on your receipt or retailer policy. We do not guess return rules.','button':'Save purchase','multipart':True})
 @login_required
-def detail(request,pk):return render(request,'detail.html',{'purchase':get_object_or_404(owned(request).select_related('receipt'),pk=pk)})
+def detail(request,pk):return render(request,'detail.html',{'purchase':get_object_or_404(owned(request).select_related('receipt').defer('receipt__data'),pk=pk)})
 @login_required
 def receipt(request,pk):
     item=get_object_or_404(Receipt,purchase__id=pk,purchase__owner=request.user,purchase__deleted_at__isnull=True)
