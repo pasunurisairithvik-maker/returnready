@@ -131,3 +131,33 @@ class ConcurrentSubmissionTests(TransactionTestCase):
             finally:close_old_connections()
         with ThreadPoolExecutor(max_workers=2) as pool:responses=list(pool.map(submit,range(2)))
         self.assertEqual(responses[0],responses[1]);self.assertEqual(responses[0][0],302);self.assertEqual(Purchase.objects.count(),1)
+
+class RecoveryKeyRotationTests(TestCase):
+    def setUp(self):
+        from django.contrib.auth import get_user_model
+        from tracker.models import Profile
+        from django.contrib.auth.hashers import make_password
+        self.user=get_user_model().objects.create_user('rotation',password='private-synthetic-pass-987!')
+        Profile.objects.create(user=self.user,recovery_hash=make_password('synthetic-recovery-token'))
+    def test_hashed_code_survives_signing_key_rotation(self):
+        from tracker.views import valid_recovery_code
+        with override_settings(SECRET_KEY='different-key-after-rotation'):
+            self.assertTrue(valid_recovery_code('synthetic-recovery-token',self.user.profile.recovery_hash))
+            self.assertFalse(valid_recovery_code('wrong',self.user.profile.recovery_hash))
+    def test_replacement_requires_password_and_invalidates_old_code(self):
+        from tracker.views import valid_recovery_code
+        self.client.force_login(self.user)
+        old=self.user.profile.recovery_hash
+        self.assertEqual(self.client.get('/account/recovery/').status_code,405)
+        self.client.post('/account/recovery/',{'password':'wrong'})
+        self.user.profile.refresh_from_db();self.assertEqual(old,self.user.profile.recovery_hash)
+        response=self.client.post('/account/recovery/',{'password':'private-synthetic-pass-987!'})
+        self.assertEqual(response.status_code,200)
+        code=response.context['code']
+        self.user.profile.refresh_from_db()
+        self.assertFalse(valid_recovery_code('synthetic-recovery-token',self.user.profile.recovery_hash))
+        self.assertTrue(valid_recovery_code(code,self.user.profile.recovery_hash))
+    def test_replacement_requires_csrf(self):
+        from django.test import Client
+        client=Client(enforce_csrf_checks=True);client.force_login(self.user)
+        self.assertEqual(client.post('/account/recovery/',{'password':'private-synthetic-pass-987!'}).status_code,403)

@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from django.db import OperationalError, InterfaceError
 from django.http import HttpResponse
 
-EVENTS={'request_complete','database_unavailable','purchase_purged','account_deleted','backup_downloaded','password_changed','housekeeping_complete'}
+EVENTS={'request_complete','database_unavailable','purchase_purged','account_deleted','backup_downloaded','password_changed','housekeeping_complete','recovery_code_replaced'}
 class SafeJSONFormatter(logging.Formatter):
     def format(self,record):
         event=record.msg if isinstance(record.msg,str) and record.msg in EVENTS else 'application_event'

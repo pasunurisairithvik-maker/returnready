@@ -58,3 +58,6 @@ On an incident: capture request IDs and aggregate statuses; check deploy status 
 - OWASP logging guidance: https://cheatsheetseries.owasp.org/cheatsheets/Logging_Cheat_Sheet.html
 - PostgreSQL backup/restore: https://www.postgresql.org/docs/18/app-pgdump.html and https://www.postgresql.org/docs/18/app-pgrestore.html
 - PyPA dependency audit: https://github.com/pypa/pip-audit
+
+## Signing-key rotation and recovery codes
+New recovery codes use Django salted password hashes and survive signing-key changes. Legacy HMAC recovery codes require their original signing key. The September 30 signing-key rotation invalidated legacy codes: users with their password can sign in and replace their recovery code in Account. Without a password or a still-valid recovery code, access cannot be restored automatically. No customer records or passwords were modified. Never claim old codes survive a key rotation, and never copy credentials into chat.

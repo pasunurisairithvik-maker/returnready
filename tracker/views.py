@@ -7,7 +7,7 @@ from django.contrib import messages
 from django.contrib.auth import login, logout, get_user_model
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.forms import SetPasswordForm, AuthenticationForm, PasswordChangeForm
-from django.contrib.auth.hashers import make_password
+from django.contrib.auth.hashers import make_password, check_password
 from django.contrib.auth import update_session_auth_hash
 from django.db import transaction, connection
 from django.db.models import Q
@@ -20,6 +20,12 @@ from .models import Purchase,Receipt,Profile,Throttle
 from .forms import RegisterForm,PurchaseForm,RecoveryForm,SettingsForm
 User=get_user_model()
 def digest(value):return hmac.new(settings.SECRET_KEY.encode(),value.encode(),hashlib.sha256).hexdigest()
+def valid_recovery_code(code,stored):
+    # Legacy HMACs remain valid while their original signing key is retained.
+    if len(stored)==64 and all(c in '0123456789abcdef' for c in stored):
+        return secrets.compare_digest(stored,digest(code))
+    return check_password(code,stored)
+
 def limited(key,limit=10):
     key=digest(key);bucket=int(time.time()//900)
     with transaction.atomic():
@@ -42,7 +48,7 @@ def sign_up(request):
                 if User.objects.count()>=settings.MAX_USERS:form.add_error(None,'The free plan is currently full.')
                 else:
                     user=form.save();code=secrets.token_urlsafe(32)
-                    Profile.objects.create(user=user,recovery_hash=digest(code));login(request,user)
+                    Profile.objects.create(user=user,recovery_hash=make_password(code));login(request,user)
                     return render(request,'recovery_code.html',{'code':code})
     return render(request,'form.html',{'form':form,'heading':'Your purchases. Your private space.','intro':'Create a username and a unique password. No email address required.','button':'Create account'})
 def canonical_username(value):return unicodedata.normalize('NFKC',value).strip().lower()
@@ -62,11 +68,11 @@ def recover(request):
             with transaction.atomic():
                 user=User.objects.filter(username=canonical_username(form.cleaned_data['username'])).first()
                 profile=Profile.objects.select_for_update().filter(user=user).first() if user else None
-                if not profile or not secrets.compare_digest(profile.recovery_hash,digest(form.cleaned_data['recovery_code'])):form.add_error(None,'Username or recovery code is incorrect.')
+                if not profile or not valid_recovery_code(form.cleaned_data['recovery_code'],profile.recovery_hash):form.add_error(None,'Username or recovery code is incorrect.')
                 else:
                     password=SetPasswordForm(user,{'new_password1':form.cleaned_data['password1'],'new_password2':form.cleaned_data['password2']})
                     if password.is_valid():
-                        password.save();code=secrets.token_urlsafe(32);profile.recovery_hash=digest(code);profile.save();login(request,user)
+                        password.save();code=secrets.token_urlsafe(32);profile.recovery_hash=make_password(code);profile.save();login(request,user)
                         return render(request,'recovery_code.html',{'code':code})
                     else:
                         for errors in password.errors.values():
@@ -243,3 +249,17 @@ def health(request):
     except Exception:return JsonResponse({'status':'unavailable'},status=503)
 
 def live(request):return JsonResponse({'status':'ok','service':'returnready'})
+
+@login_required
+@require_POST
+def replace_recovery_code(request):
+    if limited('sensitive:'+str(request.user.pk),10):
+        messages.error(request,'Too many attempts. Try again in 15 minutes.');return redirect('account')
+    if not request.user.check_password(request.POST.get('password','')):
+        messages.error(request,'Your current password is incorrect.');return redirect('account')
+    with transaction.atomic():
+        profile=Profile.objects.select_for_update().get(user=request.user)
+        code=secrets.token_urlsafe(32)
+        profile.recovery_hash=make_password(code);profile.save(update_fields=['recovery_hash'])
+    audit(request,'recovery_code_replaced')
+    return render(request,'recovery_code.html',{'code':code})
