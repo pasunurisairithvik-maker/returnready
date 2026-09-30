@@ -1,5 +1,9 @@
 # ReturnReady
 
+Live beta: https://returnready-nuwz.onrender.com/
+
+Verified launch: 25 tests pass on SQLite and PostgreSQL in CI; 9 public end-to-end checks passed using an isolated disposable account and fictional receipt. Daily read-only health and CI monitoring is configured; confirmed code failures may receive tested minimal repairs. This is not continuous monitoring or an uptime guarantee.
+
 A private purchase, receipt, return-deadline and warranty tracker for everyday use. Python/Django, PostgreSQL, responsive server-rendered pages. AI-assisted student project; no fabricated usage or impact figures.
 
 ## Working scope
