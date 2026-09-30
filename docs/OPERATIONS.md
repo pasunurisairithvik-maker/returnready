@@ -28,7 +28,7 @@ The small Neon deployment uses direct sessions: a Neon `-pooler` hostname is nor
 `docker build -t returnready:reviewed .` creates a multi-stage image running as UID/GID 10001, with no credentials in build arguments. Runtime secrets come from the deployment environment. For a local smoke test only: `docker run --rm -p 127.0.0.1:10000:10000 -e DEBUG=1 returnready:reviewed`. Production requires PostgreSQL, a strong private key, host configuration and a trusted TLS proxy. The CI smoke test checks development-mode startup; production settings and PostgreSQL behavior are separately checked. Rebuild base images regularly and scan their OS packages before enterprise adoption; the Python audit alone does not scan the container OS.
 
 ## Operator database backups
-Install a PostgreSQL client at least as new as the server (currently use 18 for Neon PostgreSQL 18). Keep a direct TLS `DATABASE_URL` in a private environment or secret manager. Never paste it into command arguments, logs or a public repository.
+Install a PostgreSQL client at least as new as the server (currently use 18 for Neon PostgreSQL 18). Set `PG_BIN_DIR` to the directory containing matching `pg_dump` and `pg_restore` binaries (for example `/usr/lib/postgresql/18/bin` on Debian/Ubuntu); do not mix archive client versions. Keep a direct TLS `DATABASE_URL` in a private environment or secret manager. Never paste it into command arguments, logs or a public repository.
 
 Create a private destination directory (`umask 077; mkdir -p backups`), then run:
 

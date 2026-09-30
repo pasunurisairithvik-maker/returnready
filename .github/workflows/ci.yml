@@ -55,6 +55,7 @@ jobs:
           DATABASE_URL: postgres://postgres:test-only-password@localhost:5432/returnready_ci?sslmode=disable
           LOCAL_POSTGRES: '1'
           RESTORE_DRILL: '1'
+          PG_BIN_DIR: /usr/lib/postgresql/18/bin
       - name: Build and smoke-test non-root container
         run: |
           docker build --tag returnready-ci .

@@ -23,6 +23,11 @@ def connection_env(url):
     env.update(PGHOST=parsed.hostname,PGPORT=str(parsed.port or 5432),PGDATABASE=unquote(parsed.path.lstrip('/')),PGUSER=unquote(parsed.username or ''),PGPASSWORD=unquote(parsed.password or ''),PGSSLMODE=sslmode,PGCONNECT_TIMEOUT='10')
     return env
 
+def pg_tool(name):
+    directory=os.getenv('PG_BIN_DIR')
+    if directory and not Path(directory).is_absolute():raise ValueError('PG_BIN_DIR must be absolute')
+    return str(Path(directory)/name) if directory else name
+
 def archive_hash(path):
     digest=hashlib.sha256()
     with open(path,'rb') as stream:
@@ -37,8 +42,8 @@ def backup(destination,url=None):
     temporary=None
     try:
         with tempfile.NamedTemporaryFile(prefix='.returnready-',dir=path.parent,delete=False) as handle:temporary=Path(handle.name)
-        subprocess.run(['pg_dump','--format=custom','--no-owner','--no-privileges','--file',str(temporary)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True,timeout=300)
-        subprocess.run(['pg_restore','--list',str(temporary)],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True,timeout=30)
+        subprocess.run([pg_tool('pg_dump'),'--format=custom','--no-owner','--no-privileges','--file',str(temporary)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True,timeout=300)
+        subprocess.run([pg_tool('pg_restore'),'--list',str(temporary)],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True,timeout=30)
         digest=archive_hash(temporary)
         os.link(temporary,path) # Atomic no-overwrite publication, even if another writer races.
         return {'sha256':digest,'bytes':path.stat().st_size,'format':'pg_dump_custom'}
@@ -54,7 +59,7 @@ def restore(path,expected_hash,url=None):
     with psycopg.connect(target,connect_timeout=10) as con:
         count=con.execute("SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg_toast%' AND c.relkind IN ('r','p','v','m','f','S')").fetchone()[0]
         if count:raise ValueError('Restore target must be empty; never clean or overwrite an existing database')
-    subprocess.run(['pg_restore','--exit-on-error','--single-transaction','--no-owner','--no-privileges','--dbname',env['PGDATABASE'],str(Path(path).resolve())],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True,timeout=300)
+    subprocess.run([pg_tool('pg_restore'),'--exit-on-error','--single-transaction','--no-owner','--no-privileges','--dbname',env['PGDATABASE'],str(Path(path).resolve())],env=env,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,check=True,timeout=300)
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
